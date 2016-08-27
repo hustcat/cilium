@@ -49,31 +49,33 @@ const (
 	DBG_TO_HOST
 	DBG_TO_STACK
 	DBG_PKT_HASH
-	DBG_LB_SERVICES_LOOKUP_FAIL
+	DBG_LB_LOOKUP_FAIL_MASTER
+	DBG_LB_LOOKUP_FAIL_SLAVE
 	DBG_LB_STATE_LOOKUP_FAIL
 )
 
 // must be in sync with <bpf/lib/conntrack.h>
 const (
-	CT_NEW uint32 = iota
+	CT_NEW int = iota
 	CT_ESTABLISHED
 	CT_REPLY
 	CT_RELATED
 )
 
-var ctState = map[uint32]string{
+var ctState = map[int]string{
 	CT_NEW:         "New",
 	CT_ESTABLISHED: "Established",
 	CT_REPLY:       "Reply",
 	CT_RELATED:     "Related",
 }
 
-func CtState(state uint32) string {
-	if state < 0 {
-		return DropReason(uint8(state))
+func CtState(state int32) string {
+	txt, ok := ctState[int(state)]
+	if ok {
+		return txt
 	}
 
-	return ctState[state]
+	return DropReason(uint8(state))
 }
 
 func CtInfo(arg1 uint32, arg2 uint32) string {
@@ -110,7 +112,7 @@ func (n *DebugMsg) Dump(data []byte, prefix string) {
 	case DBG_CT_CREATED:
 		fmt.Printf("CT created %s\n", CtInfo(n.Arg1, n.Arg2))
 	case DBG_CT_VERDICT:
-		fmt.Printf("CT verdict: %s\n", CtState(n.Arg1))
+		fmt.Printf("CT verdict: %s\n", CtState(int32(n.Arg1)))
 	case DBG_ICMP6_HANDLE:
 		fmt.Printf("Handling ICMPv6 type=%d\n", n.Arg1)
 	case DBG_ICMP6_REQUEST:
@@ -130,9 +132,11 @@ func (n *DebugMsg) Dump(data []byte, prefix string) {
 	case DBG_TO_STACK:
 		fmt.Printf("Going to the stack, policy-skip=%d\n", n.Arg1)
 	case DBG_PKT_HASH:
-		fmt.Printf("Packet hash=%d (%#x)\n", n.Arg1, n.Arg1)
-	case DBG_LB_SERVICES_LOOKUP_FAIL:
-		fmt.Printf("lb_services lookup failed, vip.p4=%x key.dport=%d\n", n.Arg1, n.Arg2)
+		fmt.Printf("Packet hash=%d (%#x), selected_service=%d\n", n.Arg1, n.Arg1, n.Arg2)
+	case DBG_LB_LOOKUP_FAIL_MASTER:
+		fmt.Printf("Master service lookup failed, vip.p4=%x key.dport=%d\n", n.Arg1, n.Arg2)
+	case DBG_LB_LOOKUP_FAIL_SLAVE:
+		fmt.Printf("Slave service lookup failed, slave=%d, dport=%d\n", n.Arg1, n.Arg2)
 	case DBG_LB_STATE_LOOKUP_FAIL:
 		fmt.Printf("lb_state lookup failed, state=%d\n", n.Arg1)
 	default:

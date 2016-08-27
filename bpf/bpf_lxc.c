@@ -103,7 +103,10 @@ static inline int ipv6_l3_from_lxc(struct __sk_buff *skb,
 {
 	union macaddr router_mac = NODE_MAC;
 	union v6addr host_ip = HOST_IP;
-	int do_nat46 = 0, ret, l4_off;
+	int do_nat46 = 0, ret, l4_off, skip_service = 0;
+	int csum_off = 0, csum_flags = 0;
+	struct lb6_service *svc;
+	struct lb6_key key = {};
 	__u16 state = 0;
 
 	if (unlikely(!valid_src_mac(eth)))
@@ -128,11 +131,21 @@ static inline int ipv6_l3_from_lxc(struct __sk_buff *skb,
 	ipv6_addr_copy(&tuple->addr, (union v6addr *) &ip6->daddr);
 
 	l4_off = l3_off + ipv6_hdrlen(skb, l3_off, &tuple->nexthdr);
+
+	/* FIXME: Reuse the tuple or make it compatible to avoid duplicate reads */
+	ret = lb6_extract_key(skb, ip6, tuple->nexthdr, l4_off, &key, &csum_off, &csum_flags);
+	if (IS_ERR(ret)) {
+		if (ret == DROP_UNKNOWN_L4)
+			skip_service = 1;
+		else
+			return ret;
+	}
+
+	/* Port reverse mapping can never happen when we balanced to a service */
 	ret = map_lxc_out(skb, l4_off, tuple->nexthdr);
 	if (IS_ERR(ret))
 		return ret;
-
-	/* WARNING: eth and ip4 offset check invalidated, revalidate before use */
+	/* WARNING: eth and ip6 offset check invalidated, revalidate before use */
 
 	/* Pass all outgoing packets through conntrack. This will create an
 	 * entry to allow reverse packets and return set cb[CB_POLICY] to
@@ -161,9 +174,15 @@ static inline int ipv6_l3_from_lxc(struct __sk_buff *skb,
 		return DROP_POLICY;
 	}
 
-	if (state) {
-		ret = lb_dsr_dnat(skb, state, tuple);
-		cilium_trace(skb, DBG_GENERIC, state, ret);
+	/* Service redirection must occur before conntrack to ensure that the
+	 * conntrack entry is created for the translated final endpoint. */
+	if (!skip_service && (svc = lb6_lookup_service(skb, &key)) != NULL) {
+		ret = lb6_local(skb, tuple->nexthdr, l3_off, l4_off, csum_off,
+				csum_flags, &key, tuple, svc);
+		if (IS_ERR(ret))
+			return ret;
+	} else if (state) {
+		ret = lb_dsr_snat(skb, l4_off, csum_off, csum_flags, state, tuple);
 		if (IS_ERR(ret))
 			return ret;
 	}
@@ -527,10 +546,8 @@ static inline int __inline__ ipv6_policy(struct __sk_buff *skb, int ifindex, __u
 	void *data = (void *) (long) skb->data;
 	void *data_end = (void *) (long) skb->data_end;
 	struct ipv6hdr *ip6 = data + ETH_HLEN;
-	int ret, l4_off, csum_off;
-	__u16 state = 0, state_zero=0;
-	union v6addr dip;
-	__be32 sum;
+	int ret, l4_off;
+	__u32 state;
 
 	if (data + sizeof(struct ipv6hdr) + ETH_HLEN > data_end)
 		return DROP_INVALID;
@@ -538,28 +555,29 @@ static inline int __inline__ ipv6_policy(struct __sk_buff *skb, int ifindex, __u
 	skb->cb[CB_POLICY] = 0;
 	tuple.nexthdr = ip6->nexthdr;
 	ipv6_addr_copy(&tuple.addr, (union v6addr *) &ip6->saddr);
+	l4_off = ETH_HLEN + ipv6_hdrlen(skb, ETH_HLEN, &tuple.nexthdr);
 
-	/*
-	 * derive state and zero it.
-	 */
-	ipv6_load_daddr(skb, ETH_HLEN, &dip);
-	state = ipv6_derive_state(&dip);
+	/* derive state and zero it. */
+	state = ip6->daddr.s6_addr32[3] & 0xFFFF;
 	if (state) {
-		ipv6_set_state(&dip, 0);
+		int csum_off, csum_flags = 0;
+		union v6addr dip;
+
+		ipv6_addr_copy(&dip, (union v6addr *) &ip6->daddr);
+		dip.p4 &= ~0xFFFF;
 		ret = ipv6_store_daddr(skb, dip.addr, ETH_HLEN);
 		if (IS_ERR(ret))
 			return DROP_WRITE_ERROR;
 
-		/* fixup csum */
-		sum = csum_diff(&state, sizeof(state), &state_zero, sizeof(state_zero), 0);
-		csum_off = l4_checksum_offset(tuple.nexthdr);
-		if (l4_csum_replace(skb, csum_off, 0, sum, BPF_F_PSEUDO_HDR) < 0)
-			return DROP_CSUM_L4;
-
-		cilium_trace(skb, DBG_GENERIC, state, 0);
+		csum_off = l4_csum_offset_and_flags(tuple.nexthdr, &csum_flags);
+		if (csum_off) {
+			__u32 zero_state = 0;
+			__be32 sum = csum_diff(&state, sizeof(state), &zero_state, sizeof(zero_state), 0);
+			if (l4_csum_replace(skb, l4_off + csum_off, 0, sum, BPF_F_PSEUDO_HDR | csum_flags) < 0)
+				return DROP_CSUM_L4;
+		}
 	}
 
-	l4_off = ETH_HLEN + ipv6_hdrlen(skb, ETH_HLEN, &tuple.nexthdr);
 	ret = ct_lookup6(&CT_MAP6, &tuple, skb, l4_off, SECLABEL, 1, NULL);
 	if (ret < 0)
 		return ret;

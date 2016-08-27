@@ -234,7 +234,7 @@ static inline int __inline__ ct_lookup6(void *map, struct ipv6_ct_tuple *tuple,
 		ret = DROP_CT_CANT_CREATE;
 
 out:
-	cilium_trace(skb, DBG_CT_VERDICT, ret, 0);
+	cilium_trace(skb, DBG_CT_VERDICT, ret < 0 ? -ret : ret, 0);
 	return ret;
 }
 
@@ -368,7 +368,7 @@ static inline int __inline__ ct_lookup4(void *map, struct ipv4_ct_tuple *tuple,
 		ret = DROP_CT_CANT_CREATE;
 
 out:
-	cilium_trace(skb, DBG_CT_VERDICT, ret, 0);
+	cilium_trace(skb, DBG_CT_VERDICT, ret < 0 ? -ret : ret, 0);
 	return ret;
 }
 

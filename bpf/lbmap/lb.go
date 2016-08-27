@@ -34,6 +34,7 @@ import (
 	"unsafe"
 
 	"github.com/cilium/cilium/common"
+	"github.com/cilium/cilium/common/addressing"
 	"github.com/cilium/cilium/common/bpf"
 	"github.com/cilium/cilium/common/types"
 	"github.com/op/go-logging"
@@ -42,43 +43,38 @@ import (
 )
 
 var (
-	log = logging.MustGetLogger("cilium-net")
+	log     = logging.MustGetLogger("cilium-net")
+	mapFile string
 )
 
 const (
+	mapSize            = 1024
 	errInvalidArgument = -1
 	errIOFailure       = -2
 )
 
-const (
-	MaxLxc = 8
-)
-
-// lbServices : LBKey => LBValue, file cilium_lb_services
-// lbState    : state => LBValue, file cilium_lb_state
+// lbServices : LBKey => LBService, file cilium_lb6_services
+// lbState    : state => LBService, file cilium_lb_state
 const (
 	lbServices = 1
 	lbState    = 2
 )
 
 type LBKey struct {
-	vip   v6Addr
-	dport uint16
-	pad   uint16
+	address v6Addr
+	dport   uint16
+	slave   uint16
 }
 
-type LBLXCPair struct {
-	LxcID  uint16
-	Port   uint16
-	NodeID uint32
+type LBService struct {
+	address v6Addr
+	port    uint16
+	count   uint16
 }
 
-type LBValue struct {
-	vip      v6Addr
-	dport    uint16
-	state    uint16
-	lxcCount int32
-	lxc      [MaxLxc]LBLXCPair
+type LBState struct {
+	address v6Addr
+	port    uint16
 }
 
 type LBMap struct {
@@ -125,11 +121,28 @@ func init() {
 				Action:    lbCreateMap,
 			},
 			{
-				Name:      "dump",
-				Aliases:   []string{"d"},
-				Usage:     "dumps map present on the given <map file>",
-				ArgsUsage: "<map file> <lbtype>",
-				Action:    lbDumpMap,
+				Name:   "dump-service",
+				Usage:  "dumps map present on the given <map file>",
+				Action: lbDumpServices,
+				Flags: []cli.Flag{
+					cli.StringFlag{
+						Destination: &mapFile,
+						Name:        "file, f",
+						Value:       "/sys/fs/bpf/tc/globals/cilium_lb6_services",
+					},
+				},
+			},
+			{
+				Name:   "dump-state",
+				Usage:  "dumps map present on the given <map file>",
+				Action: lbDumpState,
+				Flags: []cli.Flag{
+					cli.StringFlag{
+						Destination: &mapFile,
+						Name:        "file, f",
+						Value:       "/sys/fs/bpf/tc/globals/cilium_lb6_state",
+					},
+				},
 			},
 			{
 				Name:      "get",
@@ -139,11 +152,32 @@ func init() {
 				Action:    lbLookupKey,
 			},
 			{
-				Name:      "update",
+				Name:      "update-service",
 				Aliases:   []string{"u"},
 				Usage:     "updates key's value of the given <map file>",
-				ArgsUsage: "<map file> <maptype> <ipv6 addr> <dport> <state> <count> [<lxc-id> <lxc-port> <node-id> ...]",
-				Action:    lbUpdateKey,
+				ArgsUsage: "<ipv6 addr> <port> <state> <count> <lxc-id> <node-id>",
+				Action:    lbUpdateService,
+				Flags: []cli.Flag{
+					cli.StringFlag{
+						Destination: &mapFile,
+						Name:        "file, f",
+						Value:       "/sys/fs/bpf/tc/globals/cilium_lb6_services",
+					},
+				},
+			},
+			{
+				Name:      "update-state",
+				Aliases:   []string{"u"},
+				Usage:     "update LB state",
+				ArgsUsage: "<state> <ipv6 addr> <port>",
+				Action:    lbUpdateState,
+				Flags: []cli.Flag{
+					cli.StringFlag{
+						Destination: &mapFile,
+						Name:        "file, f",
+						Value:       "/sys/fs/bpf/tc/globals/cilium_lb6_state",
+					},
+				},
 			},
 			{
 				Name:    "delete",
@@ -220,15 +254,15 @@ func lbOpenMap(path string, lbtype uint) (*LBMap, error) {
 			fd, err = bpf.CreateMap(
 				C.BPF_MAP_TYPE_HASH,
 				uint32(unsafe.Sizeof(LBKey{})),
-				uint32(unsafe.Sizeof(LBValue{})),
-				32,
+				uint32(unsafe.Sizeof(LBService{})),
+				mapSize,
 			)
 		} else if lbtype == lbState {
 			fd, err = bpf.CreateMap(
 				C.BPF_MAP_TYPE_HASH,
 				uint32(unsafe.Sizeof(uint16(0))),
-				uint32(unsafe.Sizeof(LBValue{})),
-				32,
+				uint32(unsafe.Sizeof(LBState{})),
+				mapSize,
 			)
 		} else {
 			return nil, fmt.Errorf("Incorrect lbtype %d.\n", lbtype)
@@ -262,7 +296,7 @@ func lbCreateMap(ctx *cli.Context) {
 	}
 	file := ctx.Args().First()
 
-	lbtype, err := strconv.ParseUint(ctx.Args().Get(1), 10, 8)
+	lbtype, err := strconv.ParseUint(ctx.Args().Get(1), 0, 8)
 	if err != nil {
 		printArgsUsageAndExit(ctx)
 		return
@@ -274,104 +308,86 @@ func lbCreateMap(ctx *cli.Context) {
 	}
 }
 
-func lbDumpMapServices(fd int) {
+func lbDumpServices(ctx *cli.Context) {
 	var key, nextKey LBKey
-	for {
-		var lbval LBValue
-		err := bpf.GetNextKey(
-			fd,
-			unsafe.Pointer(&key),
-			unsafe.Pointer(&nextKey),
-		)
 
-		if err != nil {
-			break
-		}
-
-		err = bpf.LookupElement(
-			fd,
-			unsafe.Pointer(&nextKey),
-			unsafe.Pointer(&lbval),
-		)
-
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "%s\n", err)
-			os.Exit(errIOFailure)
-			return
-		}
-		fmt.Printf("key:%#x, state:%d, count:%d\n", nextKey, lbval.state, lbval.lxcCount)
-		for i := 0; i < int(lbval.lxcCount); i++ {
-			fmt.Printf("%+v\n", lbval.lxc[i])
-		}
-
-		key = nextKey
-	}
-}
-
-func lbDumpMapState(fd int) {
-	var key, nextKey uint16
-	for {
-		var lbval LBValue
-		err := bpf.GetNextKey(
-			fd,
-			unsafe.Pointer(&key),
-			unsafe.Pointer(&nextKey),
-		)
-
-		if err != nil {
-			break
-		}
-
-		err = bpf.LookupElement(
-			fd,
-			unsafe.Pointer(&nextKey),
-			unsafe.Pointer(&lbval),
-		)
-
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "%s\n", err)
-			os.Exit(errIOFailure)
-			return
-		}
-		fmt.Printf("key:%d, vip:%#x, dport:%#x, count:%d\n", nextKey, lbval.vip, lbval.dport, lbval.lxcCount)
-		for i := 0; i < int(lbval.lxcCount); i++ {
-			fmt.Printf("%+v\n", lbval.lxc[i])
-		}
-
-		key = nextKey
-	}
-}
-
-func lbDumpMap(ctx *cli.Context) {
-	if len(ctx.Args()) != 2 {
-		printArgsUsageAndExit(ctx)
-		return
-	}
-
-	file := ctx.Args().Get(0)
-
-	fd, err := bpf.ObjGet(file)
+	fd, err := bpf.ObjGet(mapFile)
 	if err != nil {
 		printErrorAndExit(ctx, "Failed to open file", errInvalidArgument)
 		return
 	}
 
-	lbtype, err := strconv.ParseUint(ctx.Args().Get(1), 10, 8)
+	for {
+		var lbval LBService
+		err := bpf.GetNextKey(
+			fd,
+			unsafe.Pointer(&key),
+			unsafe.Pointer(&nextKey),
+		)
+
+		if err != nil {
+			break
+		}
+
+		err = bpf.LookupElement(
+			fd,
+			unsafe.Pointer(&nextKey),
+			unsafe.Pointer(&lbval),
+		)
+
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s\n", err)
+			os.Exit(errIOFailure)
+			return
+		}
+		fmt.Printf("key:%#x, count:%d address:%#x port:%d\n",
+			nextKey, lbval.count, lbval.address, common.Swab16(lbval.port))
+
+		key = nextKey
+	}
+}
+
+func lbDumpState(ctx *cli.Context) {
+	var key, nextKey uint16
+
+	fd, err := bpf.ObjGet(mapFile)
 	if err != nil {
-		printArgsUsageAndExit(ctx)
+		printErrorAndExit(ctx, "Failed to open file", errInvalidArgument)
 		return
 	}
 
-	if lbtype == lbServices {
-		lbDumpMapServices(fd)
-	} else if lbtype == lbState {
-		lbDumpMapState(fd)
-	}
+	for {
+		var lbval LBState
+		err := bpf.GetNextKey(
+			fd,
+			unsafe.Pointer(&key),
+			unsafe.Pointer(&nextKey),
+		)
 
+		if err != nil {
+			break
+		}
+
+		err = bpf.LookupElement(
+			fd,
+			unsafe.Pointer(&nextKey),
+			unsafe.Pointer(&lbval),
+		)
+
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s\n", err)
+			os.Exit(errIOFailure)
+			return
+		}
+		fmt.Printf("key:%d, address:%#x, port:%#x\n",
+			common.Swab16(nextKey), lbval.address, common.Swab16(lbval.port))
+
+		key = nextKey
+	}
 }
 
-func lookupLb1(file string, key *LBKey) (*LBValue, error) {
-	lbval := new(LBValue)
+func lookupLb1(file string, key *LBKey) (*LBService, error) {
+	lbval := new(LBService)
 
 	fd, err := bpf.ObjGet(file)
 	if err != nil {
@@ -383,8 +399,8 @@ func lookupLb1(file string, key *LBKey) (*LBValue, error) {
 	return lbval, err
 }
 
-func lookupLb2(file string, key uint16) (*LBValue, error) {
-	lbval := new(LBValue)
+func lookupLb2(file string, key uint16) (*LBState, error) {
+	lbval := new(LBState)
 
 	fd, err := bpf.ObjGet(file)
 	if err != nil {
@@ -405,7 +421,7 @@ func lbLookupKey(ctx *cli.Context) {
 
 	file := ctx.Args().Get(0)
 
-	lbtype, err := strconv.ParseUint(ctx.Args().Get(1), 10, 8)
+	lbtype, err := strconv.ParseUint(ctx.Args().Get(1), 0, 8)
 	if err != nil {
 		printArgsUsageAndExit(ctx)
 		return
@@ -418,10 +434,10 @@ func lbLookupKey(ctx *cli.Context) {
 			printErrorAndExit(ctx, "invalid IPv6", errInvalidArgument)
 			return
 		}
-		copy(key.vip[:], iv6)
+		copy(key.address[:], iv6)
 
-		tmp, err := strconv.ParseUint(ctx.Args().Get(3), 10, 16)
-		key.dport = uint16(tmp)
+		tmp, err := strconv.ParseUint(ctx.Args().Get(3), 0, 16)
+		key.dport = common.Swab16(uint16(tmp))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s\n", err)
 			printArgsUsageAndExit(ctx)
@@ -435,16 +451,17 @@ func lbLookupKey(ctx *cli.Context) {
 			return
 		}
 
-		fmt.Printf("key.vip %v, key.dport %d\n", key.vip, key.dport)
-		fmt.Printf("value.state %d\n", lbval.state)
+		fmt.Printf("key.address %v, key.dport %d\n",
+			key.address, common.Swab16(key.dport))
+		fmt.Printf("%+v\n", lbval)
 	} else if lbtype == lbState {
-		key, err := strconv.ParseUint(ctx.Args().Get(2), 10, 16)
+		key, err := strconv.ParseUint(ctx.Args().Get(2), 0, 16)
 		if err != nil {
 			printArgsUsageAndExit(ctx)
 			return
 		}
 
-		lbval, err := lookupLb2(file, uint16(key))
+		lbval, err := lookupLb2(file, common.Swab16(uint16(key)))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s\n", err)
 			os.Exit(errIOFailure)
@@ -452,7 +469,7 @@ func lbLookupKey(ctx *cli.Context) {
 		}
 
 		fmt.Printf("key.dport %d\n", uint16(key))
-		fmt.Printf("value.state %d\n", lbval.state)
+		fmt.Printf("%+v\n", lbval)
 	} else {
 		fmt.Fprintf(os.Stderr, "Incorrect lbtype %d.\n", lbtype)
 		printArgsUsageAndExit(ctx)
@@ -460,104 +477,119 @@ func lbLookupKey(ctx *cli.Context) {
 	}
 }
 
-func lbUpdateKey(ctx *cli.Context) {
-	lbval := LBValue{}
+func lbUpdateService(ctx *cli.Context) {
+	lbval := LBService{}
+	key := LBKey{}
 
-	if len(ctx.Args()) < 5 {
+	if len(ctx.Args()) < 6 {
 		printArgsUsageAndExit(ctx)
 		return
 	}
 
-	file := ctx.Args().Get(0)
-
-	lbtype, err := strconv.ParseUint(ctx.Args().Get(1), 10, 8)
+	tmp, err := strconv.ParseUint(ctx.Args().Get(0), 0, 16)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s\n", err)
 		printArgsUsageAndExit(ctx)
 		return
 	}
+	key.slave = uint16(tmp)
 
-	iv6 := net.ParseIP(ctx.Args().Get(2))
+	iv6 := net.ParseIP(ctx.Args().Get(1))
 	if len(iv6) != net.IPv6len {
 		fmt.Fprintf(os.Stderr, "invalid IPv6\n")
 		printErrorAndExit(ctx, "invalid IPv6\n", errInvalidArgument)
 		return
 	}
-	copy(lbval.vip[:], iv6)
+	copy(key.address[:], iv6)
 
-	tmp, err := strconv.ParseUint(ctx.Args().Get(3), 10, 16)
+	tmp, err = strconv.ParseUint(ctx.Args().Get(2), 0, 16)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
 		printArgsUsageAndExit(ctx)
 		return
 	}
-	lbval.dport = uint16(tmp)
+	lbval.port = common.Swab16(uint16(tmp))
+	key.dport = lbval.port
 
-	tmp, err = strconv.ParseUint(ctx.Args().Get(4), 10, 16)
+	tmp, err = strconv.ParseUint(ctx.Args().Get(3), 0, 16)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
 		printArgsUsageAndExit(ctx)
 		return
 	}
-	lbval.state = uint16(tmp)
+	state := uint16(tmp)
 
-	count, err := strconv.ParseUint(ctx.Args().Get(5), 10, 16)
-	if err != nil || count >= MaxLxc {
+	count, err := strconv.ParseUint(ctx.Args().Get(4), 0, 16)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
 		printArgsUsageAndExit(ctx)
 		return
 	}
-	lbval.lxcCount = int32(count)
+	lbval.count = uint16(count)
 
-	arg := 6
-	for i := 0; i < int(count); i++ {
-		tmp, err = strconv.ParseUint(ctx.Args().Get(arg), 0, 16)
-		if err != nil {
-			printArgsUsageAndExit(ctx)
-			return
-		}
-		lbval.lxc[i].LxcID = uint16(tmp)
-
-		tmp, err = strconv.ParseUint(ctx.Args().Get(arg+1), 10, 16)
-		if err != nil {
-			printArgsUsageAndExit(ctx)
-			return
-		}
-		lbval.lxc[i].Port = uint16(tmp)
-
-		tmp1, err := strconv.ParseUint(ctx.Args().Get(arg+2), 0, 32)
-		if err != nil {
-			printArgsUsageAndExit(ctx)
-			return
-		}
-		lbval.lxc[i].NodeID = uint32(tmp1)
-		arg += 3
-	}
-
-	remainingArgs := ctx.Args()[arg:]
-	if len(remainingArgs) != 0 {
-		fmt.Fprintf(os.Stderr, "Extra args at end of len %d\n", len(remainingArgs))
-		printArgsUsageAndExit(ctx)
+	target, err := addressing.NewCiliumIPv6(ctx.Args().Get(5))
+	target.SetState(state)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Invalid IPv6 address: %s\n", err)
 		return
 	}
+	copy(lbval.address[:], target)
 
-	fd, err := bpf.ObjGet(file)
+	fd, err := bpf.ObjGet(mapFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
 		printArgsUsageAndExit(ctx)
 		return
 	}
 
-	if lbtype == lbServices {
-		key := LBKey{}
-		key.vip = lbval.vip
-		key.dport = lbval.dport
-		err = bpf.UpdateElement(fd, unsafe.Pointer(&key), unsafe.Pointer(&lbval), 0)
-	} else if lbtype == lbState {
-		key := lbval.state
-		u16key := uint16(key)
-		err = bpf.UpdateElement(fd, unsafe.Pointer(&u16key), unsafe.Pointer(&lbval), 0)
+	err = bpf.UpdateElement(fd, unsafe.Pointer(&key), unsafe.Pointer(&lbval), 0)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s\n", err)
+		printArgsUsageAndExit(ctx)
+		return
+	}
+}
+
+func lbUpdateState(ctx *cli.Context) {
+	lbval := LBState{}
+
+	if len(ctx.Args()) < 3 {
+		printArgsUsageAndExit(ctx)
+		return
 	}
 
+	tmp, err := strconv.ParseUint(ctx.Args().Get(0), 0, 16)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s\n", err)
+		printArgsUsageAndExit(ctx)
+		return
+	}
+	u16key := common.Swab16(uint16(tmp))
+
+	iv6 := net.ParseIP(ctx.Args().Get(1))
+	if len(iv6) != net.IPv6len {
+		fmt.Fprintf(os.Stderr, "invalid IPv6\n")
+		printErrorAndExit(ctx, "invalid IPv6\n", errInvalidArgument)
+		return
+	}
+	copy(lbval.address[:], iv6)
+
+	tmp, err = strconv.ParseUint(ctx.Args().Get(2), 0, 16)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s\n", err)
+		printArgsUsageAndExit(ctx)
+		return
+	}
+	lbval.port = common.Swab16(uint16(tmp))
+
+	fd, err := bpf.ObjGet(mapFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s\n", err)
+		printArgsUsageAndExit(ctx)
+		return
+	}
+
+	err = bpf.UpdateElement(fd, unsafe.Pointer(&u16key), unsafe.Pointer(&lbval), 0)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
 		printArgsUsageAndExit(ctx)
@@ -593,7 +625,7 @@ func lbDeleteKey(ctx *cli.Context) {
 			printErrorAndExit(ctx, "invalid IPv6\n", errInvalidArgument)
 			return
 		}
-		copy(key.vip[:], iv6)
+		copy(key.address[:], iv6)
 
 		tmp, err := strconv.ParseUint(ctx.Args().Get(3), 10, 16)
 		if err != nil {
@@ -601,7 +633,7 @@ func lbDeleteKey(ctx *cli.Context) {
 			printArgsUsageAndExit(ctx)
 			return
 		}
-		key.dport = uint16(tmp)
+		key.dport = common.Swab16(uint16(tmp))
 
 		err = bpf.DeleteElement(obj, unsafe.Pointer(&key))
 		if err != nil {
@@ -617,7 +649,7 @@ func lbDeleteKey(ctx *cli.Context) {
 			return
 		}
 
-		u16key := uint16(key)
+		u16key := common.Swab16(uint16(key))
 		err = bpf.DeleteElement(obj, unsafe.Pointer(&u16key))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s", err)

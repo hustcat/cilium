@@ -136,6 +136,7 @@ struct drop_notify {
 #define DROP_CT_CREATE_FAILED	-155
 #define DROP_INVALID_EXTHDR	-156
 #define DROP_FRAG_NOSUPPORT	-157
+#define DROP_NO_SERVICE		-158
 
 enum {
 	CB_SRC_LABEL,
@@ -179,26 +180,21 @@ struct ct_entry {
 	__u16 state;
 };
 
-struct lb_key {
-        union v6addr vip;
-        __u16 dport;
-};
+struct lb6_key {
+        union v6addr address;
+        __u16 dport;		/* L4 port filter, if unset, all ports apply */
+	__u16 slave;		/* Backend iterator, 0 indicates the master service */
+} __attribute__((packed));
 
-#define MAX_LXC                 8
-#define CILIUM_LB_MAP_SIZE	32
+struct lb6_service {
+	union v6addr target;
+	__u16 port;
+	__u16 count;
+} __attribute__((packed));
 
-struct lb_lxc_pair {
-        __u16 lxc_id;
-        __u16 port;
-        __u32 node_id;
-};
-
-struct lb_value {
-        union v6addr vip;
-        __u16 dport;
-        __u16 state;
-        int lxc_count; /* round robin across lxc */
-        struct lb_lxc_pair lxc[MAX_LXC];
-};
+struct lb6_state {
+	union v6addr address;
+	__u16 port;
+} __attribute__((packed));
 
 #endif
